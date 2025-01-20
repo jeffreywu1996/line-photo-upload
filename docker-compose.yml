@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - bot-network
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    env_file:
+      - .env
+    ports:
+      - "4040:4040"
+    command: "http --domain=pro-inviting-yeti.ngrok-free.app app:3000"
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
