@@ -136,7 +136,7 @@ func main() {
 }
 
 // Move callback handler to separate function
-func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
+func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService DriveService,
 	messageCache *MessageCache, config *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
 		log.Printf("Received %s request to %s", req.Method, req.URL.Path)
@@ -209,10 +209,24 @@ func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService *drive.Ser
 	}
 }
 
-func handleFileMessage(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
+func handleFileMessage(bot *messaging_api.MessagingApiAPI, driveService DriveService,
 	message webhook.MessageContentInterface, fileExt string, replyToken string,
 	messageCache *MessageCache, config *Config) {
-	messageID := message.(interface{ GetId() string }).GetId()
+	// Get messageID based on message type
+	var messageID string
+	switch m := message.(type) {
+	case webhook.ImageMessageContent:
+		messageID = m.Id
+	case webhook.VideoMessageContent:
+		messageID = m.Id
+	case webhook.AudioMessageContent:
+		messageID = m.Id
+	case webhook.FileMessageContent:
+		messageID = m.Id
+	default:
+		log.Printf("Unsupported message type: %T", message)
+		return
+	}
 
 	// Check if we've already processed this message
 	if messageCache.IsProcessed(messageID) {
@@ -221,16 +235,40 @@ func handleFileMessage(bot *messaging_api.MessagingApiAPI, driveService *drive.S
 	}
 
 	log.Printf("File message received (Message ID: %s)", messageID)
-	if err := handleFile(bot, driveService, message, fileExt, replyToken, config); err != nil {
+	if err := handleFile(bot, driveService, message, messageID, fileExt, replyToken, config); err != nil {
 		log.Printf("Error handling file: %v", err)
 	}
 	// Mark as processed after successful handling
 	messageCache.MarkProcessed(messageID)
 }
 
-func handleFile(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
-	message webhook.MessageContentInterface, fileExt string, replyToken string, config *Config) error {
-	messageID := message.(interface{ GetId() string }).GetId()
+type DriveService interface {
+	Files() FilesService
+}
+
+type FilesService interface {
+	Create(*drive.File) *drive.FilesCreateCall
+}
+
+// Wrapper for the real Drive service
+type driveServiceWrapper struct {
+	*drive.Service
+}
+
+func (d *driveServiceWrapper) Files() FilesService {
+	return &filesServiceWrapper{d.Service.Files}
+}
+
+type filesServiceWrapper struct {
+	*drive.FilesService
+}
+
+func (f *filesServiceWrapper) Create(file *drive.File) *drive.FilesCreateCall {
+	return f.FilesService.Create(file)
+}
+
+func handleFile(bot *messaging_api.MessagingApiAPI, driveService DriveService,
+	message webhook.MessageContentInterface, messageID string, fileExt string, replyToken string, config *Config) error {
 	log.Printf("Processing file message ID: %s", messageID)
 
 	// Get the file content from LINE
@@ -280,7 +318,7 @@ func handleFile(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
 	defer file.Close()
 
 	log.Println("Uploading file to Google Drive...")
-	uploadedFile, err := driveService.Files.Create(driveFile).Media(file).Do()
+	uploadedFile, err := driveService.Files().Create(driveFile).Media(file).Do()
 	if err != nil {
 		return fmt.Errorf("failed to upload to Drive: %v", err)
 	}
@@ -311,9 +349,14 @@ func handleFile(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
 	return nil
 }
 
-func initializeDriveClient(config *Config) (*drive.Service, error) {
+// Update the initialization function
+func initializeDriveClient(config *Config) (DriveService, error) {
 	ctx := context.Background()
 	credentials := option.WithCredentialsFile(config.GoogleCredentials)
 
-	return drive.NewService(ctx, credentials)
+	service, err := drive.NewService(ctx, credentials)
+	if err != nil {
+		return nil, err
+	}
+	return &driveServiceWrapper{service}, nil
 }
