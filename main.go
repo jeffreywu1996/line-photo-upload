@@ -175,19 +175,13 @@ func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService *drive.Ser
 
 					switch message := e.Message.(type) {
 					case webhook.ImageMessageContent:
-						messageID := message.Id
-						// Check if we've already processed this message
-						if messageCache.IsProcessed(messageID) {
-							log.Printf("Skipping already processed message ID: %s", messageID)
-							continue
-						}
-						log.Printf("Image message received (Message ID: %s)", messageID)
-						if err := handleImage(bot, driveService, messageID, e.ReplyToken, config); err != nil {
-							log.Printf("Error handling image: %v", err)
-						}
-						// Mark as processed after successful handling
-						messageCache.MarkProcessed(messageID)
-
+						handleFileMessage(bot, driveService, message, ".jpg", e.ReplyToken, messageCache, config)
+					case webhook.FileMessageContent:
+						handleFileMessage(bot, driveService, message, filepath.Ext(message.FileName), e.ReplyToken, messageCache, config)
+					case webhook.VideoMessageContent:
+						handleFileMessage(bot, driveService, message, ".mp4", e.ReplyToken, messageCache, config)
+					case webhook.AudioMessageContent:
+						handleFileMessage(bot, driveService, message, ".m4a", e.ReplyToken, messageCache, config)
 					case webhook.TextMessageContent:
 						messageID := message.Id
 						if messageCache.IsProcessed(messageID) {
@@ -215,10 +209,31 @@ func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService *drive.Ser
 	}
 }
 
-func handleImage(bot *messaging_api.MessagingApiAPI, driveService *drive.Service, messageID string, replyToken string, config *Config) error {
-	log.Printf("Processing image message ID: %s", messageID)
+func handleFileMessage(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
+	message webhook.MessageContentInterface, fileExt string, replyToken string,
+	messageCache *MessageCache, config *Config) {
+	messageID := message.(interface{ GetId() string }).GetId()
 
-	// Get the image content from LINE
+	// Check if we've already processed this message
+	if messageCache.IsProcessed(messageID) {
+		log.Printf("Skipping already processed message ID: %s", messageID)
+		return
+	}
+
+	log.Printf("File message received (Message ID: %s)", messageID)
+	if err := handleFile(bot, driveService, message, fileExt, replyToken, config); err != nil {
+		log.Printf("Error handling file: %v", err)
+	}
+	// Mark as processed after successful handling
+	messageCache.MarkProcessed(messageID)
+}
+
+func handleFile(bot *messaging_api.MessagingApiAPI, driveService *drive.Service,
+	message webhook.MessageContentInterface, fileExt string, replyToken string, config *Config) error {
+	messageID := message.(interface{ GetId() string }).GetId()
+	log.Printf("Processing file message ID: %s", messageID)
+
+	// Get the file content from LINE
 	blob, err := messaging_api.NewMessagingApiBlobAPI(config.LineChannelToken)
 	if err != nil {
 		return fmt.Errorf("failed to create blob client: %v", err)
@@ -232,7 +247,7 @@ func handleImage(bot *messaging_api.MessagingApiAPI, driveService *drive.Service
 
 	// Create a temporary file with timestamp
 	timestamp := time.Now().Format("20060102-150405")
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("line-image-%s-*.jpg", timestamp))
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("line-file-%s-*%s", timestamp, fileExt))
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %v", err)
 	}
@@ -241,15 +256,21 @@ func handleImage(bot *messaging_api.MessagingApiAPI, driveService *drive.Service
 
 	log.Printf("Created temporary file: %s", tmpFile.Name())
 
-	// Copy the image to the temporary file
+	// Copy the file content to the temporary file
 	if _, err := io.Copy(tmpFile, content.Body); err != nil {
 		return fmt.Errorf("failed to copy content: %v", err)
 	}
 
+	// Get original filename for file messages
+	fileName := filepath.Base(tmpFile.Name())
+	if fileMsg, ok := message.(webhook.FileMessageContent); ok {
+		fileName = fileMsg.FileName
+	}
+
 	// Upload to Google Drive
 	driveFile := &drive.File{
-		Name: filepath.Base(tmpFile.Name()),
-		Parents: []string{config.GoogleDriveFolderID},
+		Name:     fileName,
+		Parents:  []string{config.GoogleDriveFolderID},
 	}
 
 	file, err := os.Open(tmpFile.Name())
@@ -265,19 +286,22 @@ func handleImage(bot *messaging_api.MessagingApiAPI, driveService *drive.Service
 	}
 	log.Printf("File uploaded successfully to Drive with ID: %s", uploadedFile.Id)
 
-	// Modified reply section with error handling
+	// Send reply
+	messageText := fmt.Sprintf("File uploaded to Drive! ID: %s", uploadedFile.Id)
+	if fileMsg, ok := message.(webhook.FileMessageContent); ok {
+		messageText = fmt.Sprintf("File '%s' uploaded to Drive! ID: %s", fileMsg.FileName, uploadedFile.Id)
+	}
+
 	if _, err = bot.ReplyMessage(&messaging_api.ReplyMessageRequest{
 		ReplyToken: replyToken,
 		Messages: []messaging_api.MessageInterface{
 			&messaging_api.TextMessage{
-				Text: fmt.Sprintf("Image uploaded to Drive! ID: %s", uploadedFile.Id),
+				Text: messageText,
 			},
 		},
 	}); err != nil {
-		// Check if it's an invalid reply token error
 		if strings.Contains(err.Error(), "Invalid reply token") {
 			log.Println("Warning: Reply token expired or already used")
-			// Optionally, you could implement a push message here instead
 			return nil
 		}
 		return fmt.Errorf("failed to send reply: %v", err)
