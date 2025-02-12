@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    network_mode: "host"
+    env_file:
+      - .env
+    volumes:
+      # Mount only the credentials file
+      - ./linebot-creds.json:/app/linebot-creds.json:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ngrok:
+  #   image: ngrok/ngrok:latest
+  #   env_file:
+  #     - .env
+  #   ports:
+  #     - "4040:4040"
+  #   command: "http --domain=${NGROK_DOMAIN:-localhost} app:3000"
+  #   networks:
+  #     - bot-network

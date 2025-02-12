@@ -1,0 +1,20 @@
+# Environment variables
+.env
+
+# Google credentials
+*.json
+!example.credentials.json
+
+# Temporary files
+tmp/
+*.tmp
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
