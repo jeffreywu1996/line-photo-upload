@@ -8,16 +8,17 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/jeffreywu1996/line-photo-bot/middleware"
 	"github.com/joho/godotenv"
 	"github.com/line/line-bot-sdk-go/v8/linebot/messaging_api"
 	"github.com/line/line-bot-sdk-go/v8/linebot/webhook"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
-	"github.com/jeffreywu1996/line-photo-bot/middleware"
 )
 
 type MessageCache struct {
@@ -51,10 +52,88 @@ func (c *MessageCache) MarkProcessed(messageID string) {
 	}
 }
 
-// Add this new type for group stats
+// Update handleCommand function
+func handleCommand(bot MessageSender, text, groupID, replyToken string, groupCache *GroupCache) {
+	switch text {
+	case "/help":
+		sendMessage(bot, replyToken, `📸 LINE Photo Bot
+This bot automatically saves photos and files shared in this chat to Google Drive for easy access and backup.
+
+Available commands:
+/help - Show this help message
+/stats - Show last 5 uploads and statistics
+/upload - Show upload instructions`)
+
+	case "/stats":
+		var uploads int
+		var lastUpload time.Time
+		var recentFiles []FileInfo
+
+		if groupID != "" {
+			// Get group stats
+			uploads, lastUpload, recentFiles = groupCache.GetStats(groupID)
+		} else {
+			// Get global stats (all uploads)
+			uploads, lastUpload, recentFiles = groupCache.GetGlobalStats()
+		}
+
+		// Format recent files list
+		var recentFilesList string
+		if len(recentFiles) > 0 {
+			recentFilesList = "\n\nRecent uploads:"
+			for _, file := range recentFiles {
+				recentFilesList += fmt.Sprintf("\n%s - %s",
+					file.Timestamp.Format("2006-01-02 15:04:05"),
+					file.Name)
+			}
+		} else {
+			recentFilesList = "\n\nNo recent uploads found."
+		}
+
+		var statsTitle string
+		if groupID != "" {
+			statsTitle = "📊 Group Statistics"
+		} else {
+			statsTitle = "📊 Upload Statistics"
+		}
+
+		msg := fmt.Sprintf("%s\nTotal uploads: %d\nLast upload: %s%s",
+			statsTitle,
+			uploads,
+			lastUpload.Format("2006-01-02 15:04:05"),
+			recentFilesList)
+		sendMessage(bot, replyToken, msg)
+
+	case "/upload":
+		sendMessage(bot, replyToken, `📤 How to upload files:
+
+1. Simply share any photo, video, or file in this chat
+2. The bot will automatically save it to Google Drive
+3. Files are organized by group/chat
+
+Supported file types:
+• Photos (JPG)
+• Videos (MP4)
+• Audio files (M4A)
+• Documents (PDF, etc.)`)
+
+	default:
+		if strings.HasPrefix(text, "/") {
+			sendMessage(bot, replyToken, "Unknown command. Type /help for available commands.")
+		}
+	}
+}
+
+// Update GroupStats struct to track recent files
+type FileInfo struct {
+	Name      string
+	Timestamp time.Time
+}
+
 type GroupStats struct {
 	TotalUploads int
 	LastUpload   time.Time
+	RecentFiles  []FileInfo // Keep track of recent files
 	mu           sync.RWMutex
 }
 
@@ -85,16 +164,77 @@ func (c *GroupCache) IncrementUploads(groupID string) {
 	stats.LastUpload = time.Now()
 }
 
-func (c *GroupCache) GetStats(groupID string) (int, time.Time) {
+func (c *GroupCache) AddUploadedFile(groupID, fileName string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if _, exists := c.stats[groupID]; !exists {
+		c.stats[groupID] = &GroupStats{}
+	}
+
+	stats := c.stats[groupID]
+	stats.mu.Lock()
+	defer stats.mu.Unlock()
+
+	stats.TotalUploads++
+	stats.LastUpload = time.Now()
+
+	// Add new file to recent files
+	newFile := FileInfo{
+		Name:      fileName,
+		Timestamp: time.Now(),
+	}
+
+	// Keep only last 5 files
+	stats.RecentFiles = append([]FileInfo{newFile}, stats.RecentFiles...)
+	if len(stats.RecentFiles) > 5 {
+		stats.RecentFiles = stats.RecentFiles[:5]
+	}
+}
+
+func (c *GroupCache) GetStats(groupID string) (int, time.Time, []FileInfo) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	if stats, exists := c.stats[groupID]; exists {
 		stats.mu.RLock()
 		defer stats.mu.RUnlock()
-		return stats.TotalUploads, stats.LastUpload
+		return stats.TotalUploads, stats.LastUpload, stats.RecentFiles
 	}
-	return 0, time.Time{}
+	return 0, time.Time{}, nil
+}
+
+// Add method to get global stats
+func (c *GroupCache) GetGlobalStats() (int, time.Time, []FileInfo) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	totalUploads := 0
+	var lastUpload time.Time
+	var allFiles []FileInfo
+
+	// Collect stats from all groups
+	for _, stats := range c.stats {
+		stats.mu.RLock()
+		totalUploads += stats.TotalUploads
+		if stats.LastUpload.After(lastUpload) {
+			lastUpload = stats.LastUpload
+		}
+		allFiles = append(allFiles, stats.RecentFiles...)
+		stats.mu.RUnlock()
+	}
+
+	// Sort files by timestamp (newest first)
+	sort.Slice(allFiles, func(i, j int) bool {
+		return allFiles[i].Timestamp.After(allFiles[j].Timestamp)
+	})
+
+	// Return only the last 5 files
+	if len(allFiles) > 5 {
+		allFiles = allFiles[:5]
+	}
+
+	return totalUploads, lastUpload, allFiles
 }
 
 // Add configuration struct
@@ -103,8 +243,8 @@ type Config struct {
 	LineChannelToken    string
 	GoogleCredentials   string
 	GoogleDriveFolderID string
-	Port               string
-	AdminUsers         []string // List of user IDs who have admin privileges
+	Port                string
+	AdminUsers          []string // List of user IDs who have admin privileges
 }
 
 func loadConfig() (*Config, error) {
@@ -117,7 +257,7 @@ func loadConfig() (*Config, error) {
 		LineChannelToken:    os.Getenv("LINE_CHANNEL_TOKEN"),
 		GoogleCredentials:   os.Getenv("GOOGLE_APPLICATION_CREDENTIALS"),
 		GoogleDriveFolderID: os.Getenv("GOOGLE_DRIVE_FOLDER_ID"),
-		Port:               os.Getenv("PORT"),
+		Port:                os.Getenv("PORT"),
 	}
 
 	// Validate required fields
@@ -137,6 +277,33 @@ func loadConfig() (*Config, error) {
 	}
 
 	return config, nil
+}
+
+// Update the interface to match the SDK
+type BlobAPI interface {
+	GetMessageContent(messageID string) (io.ReadCloser, error)
+}
+
+// Update the real implementation
+type realBlobAPI struct {
+	api *messaging_api.MessagingApiBlobAPI
+}
+
+func (r *realBlobAPI) GetMessageContent(messageID string) (io.ReadCloser, error) {
+	resp, err := r.api.GetMessageContent(messageID)
+	if err != nil {
+		return nil, err
+	}
+	return resp.Body, nil
+}
+
+// Provide a function we can override in tests:
+var NewBlobAPI = func(channelToken string) (BlobAPI, error) {
+	api, err := messaging_api.NewMessagingApiBlobAPI(channelToken)
+	if err != nil {
+		return nil, err
+	}
+	return &realBlobAPI{api: api}, nil
 }
 
 func main() {
@@ -182,16 +349,232 @@ func main() {
 	})
 
 	// Wrap router with middleware
-	handler := middleware.ErrorHandler(middleware.RequestLogger(router))
+	handler := middleware.ErrorHandler(
+		middleware.SecurityHeaders(
+			middleware.RequestLogger(router),
+		),
+	)
 
-	// Start server with middleware
+	// Create server with timeouts
+	server := &http.Server{
+		Addr:         ":" + config.Port,
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
 	log.Printf("Server is running at :%s", config.Port)
-	if err := http.ListenAndServe(":"+config.Port, handler); err != nil {
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
 
-// Update the callbackHandler function to only handle commands
+type MessageSender interface {
+	ReplyMessage(request *messaging_api.ReplyMessageRequest) (*messaging_api.ReplyMessageResponse, error)
+}
+
+func sendMessage(bot MessageSender, replyToken, text string) {
+	if bot == nil {
+		log.Printf("Error: bot is nil in sendMessage")
+		return
+	}
+
+	if replyToken == "" {
+		log.Printf("Error: empty reply token in sendMessage")
+		return
+	}
+
+	if _, err := bot.ReplyMessage(&messaging_api.ReplyMessageRequest{
+		ReplyToken: replyToken,
+		Messages: []messaging_api.MessageInterface{
+			&messaging_api.TextMessage{Text: text},
+		},
+	}); err != nil {
+		log.Printf("Error sending message: %v", err)
+	}
+}
+
+func getOrCreateGroupFolder(driveService DriveService, groupID, parentFolderID string) string {
+	folderName := fmt.Sprintf("LINE-Group-%s", groupID)
+	folder := &drive.File{
+		Name:     folderName,
+		Parents:  []string{parentFolderID},
+		MimeType: "application/vnd.google-apps.folder",
+	}
+
+	createdFolder, err := driveService.Files().CreateFile(folder, nil)
+	if err != nil {
+		log.Printf("Error creating group folder: %v", err)
+		return parentFolderID
+	}
+	return createdFolder.Id
+}
+
+func getFileExtension(message webhook.MessageContentInterface) string {
+	switch m := message.(type) {
+	case webhook.ImageMessageContent:
+		return ".jpg"
+	case webhook.VideoMessageContent:
+		return ".mp4"
+	case webhook.AudioMessageContent:
+		return ".m4a"
+	case webhook.FileMessageContent:
+		return filepath.Ext(m.FileName)
+	default:
+		return ""
+	}
+}
+
+func handleFileMessage(bot *messaging_api.MessagingApiAPI, driveService DriveService,
+	message webhook.MessageContentInterface, fileExt string, replyToken string,
+	messageCache *MessageCache, folderID string, config *Config) error {
+	// Get messageID based on message type
+	var messageID string
+	switch m := message.(type) {
+	case webhook.ImageMessageContent:
+		messageID = m.Id
+	case webhook.VideoMessageContent:
+		messageID = m.Id
+	case webhook.AudioMessageContent:
+		messageID = m.Id
+	case webhook.FileMessageContent:
+		messageID = m.Id
+	default:
+		log.Printf("Unsupported message type: %T", message)
+		return fmt.Errorf("unsupported message type: %T", message)
+	}
+
+	// Check if we've already processed this message
+	if messageCache.IsProcessed(messageID) {
+		log.Printf("Skipping already processed message ID: %s", messageID)
+		return nil
+	}
+
+	log.Printf("File message received (Message ID: %s)", messageID)
+	if err := handleFile(bot, driveService, message, messageID, fileExt, replyToken, config); err != nil {
+		log.Printf("Error handling file: %v", err)
+		return err
+	}
+	// Mark as processed after successful handling
+	messageCache.MarkProcessed(messageID)
+	return nil
+}
+
+type DriveService interface {
+	Files() FilesService
+}
+
+type FilesService interface {
+	CreateFile(file *drive.File, media io.Reader) (*drive.File, error)
+}
+
+// Wrapper for the real Drive service
+type driveServiceWrapper struct {
+	*drive.Service
+}
+
+func (d *driveServiceWrapper) Files() FilesService {
+	return &filesServiceWrapper{d.Service.Files}
+}
+
+type filesServiceWrapper struct {
+	*drive.FilesService
+}
+
+func (f *filesServiceWrapper) CreateFile(file *drive.File, media io.Reader) (*drive.File, error) {
+	call := f.FilesService.Create(file)
+	if media != nil {
+		call.Media(media)
+	}
+	return call.Do()
+}
+
+// Update handleFile to use the variable
+func handleFile(bot *messaging_api.MessagingApiAPI, driveService DriveService,
+	message webhook.MessageContentInterface, messageID string, fileExt string, replyToken string, config *Config) error {
+	log.Printf("Processing file message ID: %s", messageID)
+
+	// Get the file content from LINE
+	blob, err := NewBlobAPI(config.LineChannelToken)
+	if err != nil {
+		return fmt.Errorf("failed to create blob client: %v", err)
+	}
+
+	content, err := blob.GetMessageContent(messageID)
+	if err != nil {
+		return fmt.Errorf("failed to get content: %v", err)
+	}
+	defer content.Close()
+
+	// Create a temporary file with timestamp
+	timestamp := time.Now().Format("20060102-150405")
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("line-file-%s-*%s", timestamp, fileExt))
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Copy the file content and track size
+	written, err := io.Copy(tmpFile, content)
+	if err != nil {
+		return fmt.Errorf("failed to copy content: %v", err)
+	}
+	log.Printf("File size: %.2f MB", float64(written)/(1024*1024))
+
+	// Get original filename for file messages
+	fileName := filepath.Base(tmpFile.Name())
+	if fileMsg, ok := message.(webhook.FileMessageContent); ok {
+		fileName = fileMsg.FileName
+	}
+
+	// Upload to Google Drive
+	driveFile := &drive.File{
+		Name:    fileName,
+		Parents: []string{config.GoogleDriveFolderID},
+	}
+
+	file, err := os.Open(tmpFile.Name())
+	if err != nil {
+		return fmt.Errorf("failed to open temp file: %v", err)
+	}
+	defer file.Close()
+
+	log.Println("Uploading file to Google Drive...")
+	uploadedFile, err := driveService.Files().CreateFile(driveFile, file)
+	if err != nil {
+		return fmt.Errorf("failed to upload to Drive: %v", err)
+	}
+	log.Printf("File uploaded successfully to Drive with ID: %s", uploadedFile.Id)
+
+	// Remove the reply message code
+	// The function should just return nil after successful upload
+	return nil
+}
+
+// Update the initialization function
+func initializeDriveClient(config *Config) (DriveService, error) {
+	ctx := context.Background()
+	credentials := option.WithCredentialsFile(config.GoogleCredentials)
+
+	service, err := drive.NewService(ctx, credentials)
+	if err != nil {
+		return nil, err
+	}
+	return &driveServiceWrapper{service}, nil
+}
+
+func isAllowedUser(userID string, config *Config) bool {
+	for _, adminID := range config.AdminUsers {
+		if userID == adminID {
+			return true
+		}
+	}
+	return true // Allow all users by default
+}
+
+// Add the callbackHandler function
 func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService DriveService,
 	messageCache *MessageCache, groupCache *GroupCache, config *Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, req *http.Request) {
@@ -249,274 +632,32 @@ func callbackHandler(bot *messaging_api.MessagingApiAPI, driveService DriveServi
 						folderID := config.GoogleDriveFolderID
 						if groupID != "" {
 							folderID = getOrCreateGroupFolder(driveService, groupID, config.GoogleDriveFolderID)
-							defer func() {
-								groupCache.IncrementUploads(groupID)
-							}()
 						}
 
-						// Handle the file upload with the appropriate folder
-						handleFileMessage(bot, driveService, e.Message, getFileExtension(e.Message),
-							e.ReplyToken, messageCache, folderID, config)
+						// Get filename for tracking
+						var fileName string
+						if fileMsg, ok := message.(webhook.FileMessageContent); ok {
+							fileName = fileMsg.FileName
+						} else {
+							fileName = fmt.Sprintf("file%s", getFileExtension(e.Message))
+						}
+
+						// Handle the file upload
+						if err := handleFileMessage(bot, driveService, e.Message, getFileExtension(e.Message),
+							e.ReplyToken, messageCache, folderID, config); err != nil {
+							log.Printf("Error handling file: %v", err)
+							continue
+						}
+
+						// Track all uploads, using "direct" as groupID for direct messages
+						trackingGroupID := groupID
+						if trackingGroupID == "" {
+							trackingGroupID = "direct"
+						}
+						groupCache.AddUploadedFile(trackingGroupID, fileName)
 					}
 				}
 			}
 		}()
 	}
-}
-
-type MessageSender interface {
-	ReplyMessage(request *messaging_api.ReplyMessageRequest) (*messaging_api.ReplyMessageResponse, error)
-}
-
-// Rename handleGroupCommand to handleCommand and update it to work for both group and direct messages
-func handleCommand(bot MessageSender, text, groupID, replyToken string, groupCache *GroupCache) {
-	switch text {
-	case "/help":
-		sendMessage(bot, replyToken, `Available commands:
-/help - Show this help message
-/stats - Show upload statistics (group only)
-/upload - Show upload instructions`)
-
-	case "/stats":
-		if groupID == "" {
-			sendMessage(bot, replyToken, "Stats command is only available in groups")
-			return
-		}
-		uploads, lastUpload := groupCache.GetStats(groupID)
-		var lastUploadStr string
-		if !lastUpload.IsZero() {
-			lastUploadStr = lastUpload.Format("2006-01-02 15:04:05")
-		} else {
-			lastUploadStr = "Never"
-		}
-
-		msg := fmt.Sprintf("Group Statistics:\nTotal uploads: %d\nLast upload: %s",
-			uploads, lastUploadStr)
-		sendMessage(bot, replyToken, msg)
-
-	case "/upload":
-		sendMessage(bot, replyToken, "To upload files:\n1. Send an image, video, audio, or file\n2. I will upload it to Google Drive\n3. I will reply with the file ID")
-
-	default:
-		if strings.HasPrefix(text, "/") {
-			sendMessage(bot, replyToken, "Unknown command. Type /help for available commands.")
-		}
-	}
-}
-
-func sendMessage(bot MessageSender, replyToken, text string) {
-	if bot == nil {
-		log.Printf("Error: bot is nil in sendMessage")
-		return
-	}
-
-	if replyToken == "" {
-		log.Printf("Error: empty reply token in sendMessage")
-		return
-	}
-
-	if _, err := bot.ReplyMessage(&messaging_api.ReplyMessageRequest{
-		ReplyToken: replyToken,
-		Messages: []messaging_api.MessageInterface{
-			&messaging_api.TextMessage{Text: text},
-		},
-	}); err != nil {
-		log.Printf("Error sending message: %v", err)
-	}
-}
-
-func getOrCreateGroupFolder(driveService DriveService, groupID, parentFolderID string) string {
-	folderName := fmt.Sprintf("LINE-Group-%s", groupID)
-	folder := &drive.File{
-		Name:     folderName,
-		Parents:  []string{parentFolderID},
-		MimeType: "application/vnd.google-apps.folder",
-	}
-
-	createdFolder, err := driveService.Files().CreateFile(folder, nil)
-	if err != nil {
-		log.Printf("Error creating group folder: %v", err)
-		return parentFolderID
-	}
-	return createdFolder.Id
-}
-
-func getFileExtension(message webhook.MessageContentInterface) string {
-	switch m := message.(type) {
-	case webhook.ImageMessageContent:
-		return ".jpg"
-	case webhook.VideoMessageContent:
-		return ".mp4"
-	case webhook.AudioMessageContent:
-		return ".m4a"
-	case webhook.FileMessageContent:
-		return filepath.Ext(m.FileName)
-	default:
-		return ""
-	}
-}
-
-func handleFileMessage(bot *messaging_api.MessagingApiAPI, driveService DriveService,
-	message webhook.MessageContentInterface, fileExt string, replyToken string,
-	messageCache *MessageCache, folderID string, config *Config) {
-	// Get messageID based on message type
-	var messageID string
-	switch m := message.(type) {
-	case webhook.ImageMessageContent:
-		messageID = m.Id
-	case webhook.VideoMessageContent:
-		messageID = m.Id
-	case webhook.AudioMessageContent:
-		messageID = m.Id
-	case webhook.FileMessageContent:
-		messageID = m.Id
-	default:
-		log.Printf("Unsupported message type: %T", message)
-		return
-	}
-
-	// Check if we've already processed this message
-	if messageCache.IsProcessed(messageID) {
-		log.Printf("Skipping already processed message ID: %s", messageID)
-		return
-	}
-
-	log.Printf("File message received (Message ID: %s)", messageID)
-	if err := handleFile(bot, driveService, message, messageID, fileExt, replyToken, config); err != nil {
-		log.Printf("Error handling file: %v", err)
-	}
-	// Mark as processed after successful handling
-	messageCache.MarkProcessed(messageID)
-}
-
-type DriveService interface {
-	Files() FilesService
-}
-
-type FilesService interface {
-	CreateFile(file *drive.File, media io.Reader) (*drive.File, error)
-}
-
-// Wrapper for the real Drive service
-type driveServiceWrapper struct {
-	*drive.Service
-}
-
-func (d *driveServiceWrapper) Files() FilesService {
-	return &filesServiceWrapper{d.Service.Files}
-}
-
-type filesServiceWrapper struct {
-	*drive.FilesService
-}
-
-func (f *filesServiceWrapper) CreateFile(file *drive.File, media io.Reader) (*drive.File, error) {
-	call := f.FilesService.Create(file)
-	if media != nil {
-		call.Media(media)
-	}
-	return call.Do()
-}
-
-func handleFile(bot *messaging_api.MessagingApiAPI, driveService DriveService,
-	message webhook.MessageContentInterface, messageID string, fileExt string, replyToken string, config *Config) error {
-	log.Printf("Processing file message ID: %s", messageID)
-
-	// Get the file content from LINE
-	blob, err := messaging_api.NewMessagingApiBlobAPI(config.LineChannelToken)
-	if err != nil {
-		return fmt.Errorf("failed to create blob client: %v", err)
-	}
-
-	content, err := blob.GetMessageContent(messageID)
-	if err != nil {
-		return fmt.Errorf("failed to get content: %v", err)
-	}
-	defer content.Body.Close()
-
-	// Create a temporary file with timestamp
-	timestamp := time.Now().Format("20060102-150405")
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("line-file-%s-*%s", timestamp, fileExt))
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %v", err)
-	}
-	defer os.Remove(tmpFile.Name())
-	defer tmpFile.Close()
-
-	log.Printf("Created temporary file: %s", tmpFile.Name())
-
-	// Copy the file content to the temporary file
-	if _, err := io.Copy(tmpFile, content.Body); err != nil {
-		return fmt.Errorf("failed to copy content: %v", err)
-	}
-
-	// Get original filename for file messages
-	fileName := filepath.Base(tmpFile.Name())
-	if fileMsg, ok := message.(webhook.FileMessageContent); ok {
-		fileName = fileMsg.FileName
-	}
-
-	// Upload to Google Drive
-	driveFile := &drive.File{
-		Name:     fileName,
-		Parents:  []string{config.GoogleDriveFolderID},
-	}
-
-	file, err := os.Open(tmpFile.Name())
-	if err != nil {
-		return fmt.Errorf("failed to open temp file: %v", err)
-	}
-	defer file.Close()
-
-	log.Println("Uploading file to Google Drive...")
-	uploadedFile, err := driveService.Files().CreateFile(driveFile, file)
-	if err != nil {
-		return fmt.Errorf("failed to upload to Drive: %v", err)
-	}
-	log.Printf("File uploaded successfully to Drive with ID: %s", uploadedFile.Id)
-
-	// Send reply
-	messageText := fmt.Sprintf("File uploaded to Drive! ID: %s", uploadedFile.Id)
-	if fileMsg, ok := message.(webhook.FileMessageContent); ok {
-		messageText = fmt.Sprintf("File '%s' uploaded to Drive! ID: %s", fileMsg.FileName, uploadedFile.Id)
-	}
-
-	if _, err = bot.ReplyMessage(&messaging_api.ReplyMessageRequest{
-		ReplyToken: replyToken,
-		Messages: []messaging_api.MessageInterface{
-			&messaging_api.TextMessage{
-				Text: messageText,
-			},
-		},
-	}); err != nil {
-		if strings.Contains(err.Error(), "Invalid reply token") {
-			log.Println("Warning: Reply token expired or already used")
-			return nil
-		}
-		return fmt.Errorf("failed to send reply: %v", err)
-	}
-	log.Println("Success reply sent to user")
-
-	return nil
-}
-
-// Update the initialization function
-func initializeDriveClient(config *Config) (DriveService, error) {
-	ctx := context.Background()
-	credentials := option.WithCredentialsFile(config.GoogleCredentials)
-
-	service, err := drive.NewService(ctx, credentials)
-	if err != nil {
-		return nil, err
-	}
-	return &driveServiceWrapper{service}, nil
-}
-
-func isAllowedUser(userID string, config *Config) bool {
-	for _, adminID := range config.AdminUsers {
-		if userID == adminID {
-			return true
-		}
-	}
-	return true // Allow all users by default
 }

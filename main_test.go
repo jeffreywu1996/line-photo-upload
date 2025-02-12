@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -50,8 +52,8 @@ func TestLoadConfig(t *testing.T) {
 
 	// Test config values
 	tests := []struct {
-		got      string
-		want     string
+		got       string
+		want      string
 		fieldName string
 	}{
 		{config.LineChannelSecret, "test-secret", "LineChannelSecret"},
@@ -83,29 +85,51 @@ func TestGroupCache(t *testing.T) {
 	groupID := "test-group-123"
 
 	// Test initial state
-	uploads, lastUpload := cache.GetStats(groupID)
+	uploads, lastUpload, files := cache.GetStats(groupID)
 	if uploads != 0 {
 		t.Errorf("Initial uploads = %d, want 0", uploads)
 	}
 	if !lastUpload.IsZero() {
 		t.Error("Initial lastUpload should be zero time")
 	}
+	if len(files) != 0 {
+		t.Error("Initial files should be empty")
+	}
 
 	// Test increment
-	cache.IncrementUploads(groupID)
-	uploads, lastUpload = cache.GetStats(groupID)
+	cache.AddUploadedFile(groupID, "test.jpg")
+	uploads, lastUpload, files = cache.GetStats(groupID)
 	if uploads != 1 {
 		t.Errorf("Uploads after increment = %d, want 1", uploads)
 	}
 	if lastUpload.IsZero() {
 		t.Error("LastUpload should not be zero after increment")
 	}
+	if len(files) != 1 {
+		t.Error("Should have one file in history")
+	}
 
-	// Test multiple increments
-	cache.IncrementUploads(groupID)
-	uploads, _ = cache.GetStats(groupID)
+	// Test multiple files
+	cache.AddUploadedFile(groupID, "test2.jpg")
+	uploads, _, files = cache.GetStats(groupID)
 	if uploads != 2 {
 		t.Errorf("Uploads after second increment = %d, want 2", uploads)
+	}
+	if len(files) != 2 {
+		t.Error("Should have two files in history")
+	}
+
+	// Test file limit (should keep only last 5)
+	for i := 0; i < 5; i++ {
+		cache.AddUploadedFile(groupID, fmt.Sprintf("test%d.jpg", i+3))
+	}
+	_, _, files = cache.GetStats(groupID)
+	if len(files) != 5 {
+		t.Errorf("Should have 5 files in history, got %d", len(files))
+	}
+	// Verify it's keeping the most recent files
+	if files[0].Name != "test7.jpg" {
+		t.Errorf("Most recent file should be test7.jpg, got %s", files[0].Name)
 	}
 }
 
@@ -171,81 +195,107 @@ func TestIsAllowedUser(t *testing.T) {
 }
 
 func TestHandleCommand(t *testing.T) {
-	// Create a mock bot that doesn't make real API calls
-	mockBot := &mockBotWithoutAPI{
-		sentMessages: make([]string, 0),
-	}
-	groupCache := NewGroupCache()
-	groupID := "test-group-123"
-	replyToken := "test-reply-token"
-
-	// Add some test data
-	groupCache.IncrementUploads(groupID)
-	time.Sleep(time.Millisecond)
-	groupCache.IncrementUploads(groupID)
-
 	tests := []struct {
-		name          string
-		command       string
-		groupID       string // Add groupID to test both group and direct messages
-		expectMessage bool
+		name      string
+		text      string
+		groupID   string
+		wantText  string
+		checkFunc func(string) bool
 	}{
 		{
-			name:          "Help command",
-			command:       "/help",
-			groupID:       groupID,
-			expectMessage: true,
+			name: "Help command",
+			text: "/help",
+			wantText: `📸 LINE Photo Bot
+This bot automatically saves photos and files shared in this chat to Google Drive for easy access and backup.
+
+Available commands:
+/help - Show this help message
+/stats - Show last 5 uploads and statistics
+/upload - Show upload instructions`,
 		},
 		{
-			name:          "Stats command in group",
-			command:       "/stats",
-			groupID:       groupID,
-			expectMessage: true,
+			name:    "Stats command in group",
+			text:    "/stats",
+			groupID: "test-group",
+			checkFunc: func(msg string) bool {
+				return strings.Contains(msg, "📊 Group Statistics") &&
+					strings.Contains(msg, "Total uploads: 2") &&
+					strings.Contains(msg, "test1.jpg") &&
+					strings.Contains(msg, "test2.jpg")
+			},
 		},
 		{
-			name:          "Stats command in direct message",
-			command:       "/stats",
-			groupID:       "", // Empty groupID for direct message
-			expectMessage: true,
+			name: "Stats command in direct message",
+			text: "/stats",
+			checkFunc: func(msg string) bool {
+				return strings.Contains(msg, "📊 Upload Statistics") &&
+					strings.Contains(msg, "Total uploads: 2") &&
+					strings.Contains(msg, "test1.jpg") &&
+					strings.Contains(msg, "test2.jpg")
+			},
 		},
 		{
-			name:          "Upload command",
-			command:       "/upload",
-			groupID:       groupID,
-			expectMessage: true,
+			name: "Upload command",
+			text: "/upload",
+			wantText: `📤 How to upload files:
+
+1. Simply share any photo, video, or file in this chat
+2. The bot will automatically save it to Google Drive
+3. Files are organized by group/chat
+
+Supported file types:
+• Photos (JPG)
+• Videos (MP4)
+• Audio files (M4A)
+• Documents (PDF, etc.)`,
 		},
 		{
-			name:          "Invalid command",
-			command:       "/invalid",
-			groupID:       groupID,
-			expectMessage: true, // Now returns "Unknown command" message
+			name:     "Invalid command",
+			text:     "/invalid",
+			wantText: "Unknown command. Type /help for available commands.",
 		},
 		{
-			name:          "Non-command message",
-			command:       "hello",
-			groupID:       groupID,
-			expectMessage: false,
+			name:     "Non-command message",
+			text:     "Hello",
+			wantText: "", // Non-command messages should not trigger any response
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			mockBot.sentMessages = make([]string, 0) // Reset messages
-			handleCommand(mockBot, tt.command, tt.groupID, replyToken, groupCache)
+			// Create a new mock bot for each test case
+			bot := newMockBot()
+			groupCache := NewGroupCache()
 
-			if tt.expectMessage && len(mockBot.sentMessages) == 0 {
-				t.Error("Expected a message to be sent, but none was sent")
-			}
-			if !tt.expectMessage && len(mockBot.sentMessages) > 0 {
-				t.Error("Expected no message to be sent, but one was sent")
+			// Add test data only if needed for stats commands
+			if strings.Contains(tt.name, "Stats command") {
+				groupCache.AddUploadedFile("test-group", "test1.jpg")
+				groupCache.AddUploadedFile("test-group", "test2.jpg")
 			}
 
-			// Additional checks for specific commands
-			if tt.command == "/stats" && tt.groupID == "" {
-				// Verify stats command in direct message shows the correct error
-				if len(mockBot.sentMessages) > 0 && mockBot.sentMessages[0] != "Stats command is only available in groups" {
-					t.Error("Expected 'Stats command is only available in groups' message")
+			handleCommand(bot, tt.text, tt.groupID, "test-reply-token", groupCache)
+
+			// For non-command messages, verify no message was sent
+			if tt.text != "" && !strings.HasPrefix(tt.text, "/") {
+				if len(bot.sentMessages) > 0 {
+					t.Errorf("Non-command message should not trigger a response, got %v", bot.sentMessages)
 				}
+				return
+			}
+
+			// For commands, verify the response
+			if len(bot.sentMessages) == 0 {
+				t.Error("No message was sent")
+				return
+			}
+
+			got := bot.sentMessages[len(bot.sentMessages)-1]
+			if tt.checkFunc != nil {
+				if !tt.checkFunc(got) {
+					t.Errorf("Message does not match expected format. Got: %s", got)
+				}
+			} else if got != tt.wantText {
+				t.Errorf("handleCommand() = %v, want %v", got, tt.wantText)
 			}
 		})
 	}
@@ -333,17 +383,22 @@ func TestGetFileExtension(t *testing.T) {
 
 // Mock implementations
 type mockBot struct {
-	*messaging_api.MessagingApiAPI
+	sentMessages []string
 }
 
-func newMockBot() *messaging_api.MessagingApiAPI {
-	// Create a properly initialized mock bot
-	bot, err := messaging_api.NewMessagingApiAPI("mock-token")
-	if err != nil {
-		// In a test environment, this shouldn't fail
-		panic(fmt.Sprintf("Failed to create mock bot: %v", err))
+func (m *mockBot) ReplyMessage(request *messaging_api.ReplyMessageRequest) (*messaging_api.ReplyMessageResponse, error) {
+	for _, msg := range request.Messages {
+		if textMsg, ok := msg.(*messaging_api.TextMessage); ok {
+			m.sentMessages = append(m.sentMessages, textMsg.Text)
+		}
 	}
-	return bot
+	return &messaging_api.ReplyMessageResponse{}, nil
+}
+
+func newMockBot() *mockBot {
+	return &mockBot{
+		sentMessages: make([]string, 0),
+	}
 }
 
 // Mock implementations for Google Drive API
@@ -383,7 +438,28 @@ func newTestConfig() *Config {
 	}
 }
 
+// Update mockBlobAPI to match the interface
+type mockBlobAPI struct {
+	content []byte
+}
+
+func (m *mockBlobAPI) GetMessageContent(messageID string) (io.ReadCloser, error) {
+	return io.NopCloser(bytes.NewReader(m.content)), nil
+}
+
 func TestHandleFileMessage(t *testing.T) {
+	// Create some mock content
+	mockContent := []byte("fake file content")
+
+	// Save the original function so we can restore it
+	originalNewBlobAPI := NewBlobAPI
+	defer func() { NewBlobAPI = originalNewBlobAPI }()
+
+	// Override NewBlobAPI to return our mock
+	NewBlobAPI = func(channelToken string) (BlobAPI, error) {
+		return &mockBlobAPI{content: mockContent}, nil
+	}
+
 	tests := []struct {
 		name        string
 		message     webhook.MessageContentInterface
@@ -434,18 +510,48 @@ func TestHandleFileMessage(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create mock dependencies
-			bot := newMockBot()
+			bot := &messaging_api.MessagingApiAPI{} // Use real type but mock the calls
 			driveService := newMockDriveService()
 			messageCache := NewMessageCache()
-			config := newTestConfig()
+			config := &Config{
+				LineChannelToken:    "mock-token",
+				GoogleDriveFolderID: "mock-folder",
+			}
 			replyToken := "test-reply-token"
 
-			// Call handleFileMessage with all required parameters
-			handleFileMessage(bot, driveService, tt.message, tt.fileExt, replyToken,
+			// Create temporary test file
+			tmpContent := []byte("test content")
+			tmpfile, err := os.CreateTemp("", "test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.Remove(tmpfile.Name())
+			if _, err := tmpfile.Write(tmpContent); err != nil {
+				t.Fatal(err)
+			}
+			if err := tmpfile.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Call handleFileMessage
+			err = handleFileMessage(bot, driveService, tt.message, tt.fileExt, replyToken,
 				messageCache, config.GoogleDriveFolderID, config)
 
-			// Verify message was processed (or not) as expected
-			messageID := ""
+			// Verify results
+			if tt.shouldError {
+				if err == nil {
+					t.Error("expected error but got none")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+
+			// Get messageID based on message type
+			var messageID string
 			switch m := tt.message.(type) {
 			case webhook.ImageMessageContent:
 				messageID = m.Id
@@ -457,11 +563,8 @@ func TestHandleFileMessage(t *testing.T) {
 				messageID = m.Id
 			}
 
-			if !tt.shouldError && !messageCache.IsProcessed(messageID) {
+			if !messageCache.IsProcessed(messageID) {
 				t.Errorf("message %s should have been processed", messageID)
-			}
-			if tt.shouldError && messageCache.IsProcessed(messageID) {
-				t.Errorf("message %s should not have been processed", messageID)
 			}
 		})
 	}
@@ -489,4 +592,108 @@ func (m *mockBotWithoutAPI) ReplyMessage(request *messaging_api.ReplyMessageRequ
 		}
 	}
 	return &messaging_api.ReplyMessageResponse{}, nil
+}
+
+func TestStatsTracking(t *testing.T) {
+	// Create dependencies
+	groupCache := NewGroupCache()
+	bot := newMockBot()
+
+	// Test cases for different upload scenarios
+	tests := []struct {
+		name    string
+		uploads []struct {
+			groupID  string
+			fileName string
+		}
+		checkStats []struct {
+			groupID     string // empty for direct message stats
+			wantUploads int
+			wantFiles   []string
+		}
+	}{
+		{
+			name: "Group and direct uploads",
+			uploads: []struct {
+				groupID  string
+				fileName string
+			}{
+				{groupID: "group1", fileName: "group1_file1.jpg"},
+				{groupID: "group1", fileName: "group1_file2.jpg"},
+				{groupID: "group2", fileName: "group2_file1.jpg"},
+				{groupID: "", fileName: "direct_file1.jpg"}, // direct message
+				{groupID: "", fileName: "direct_file2.jpg"}, // direct message
+			},
+			checkStats: []struct {
+				groupID     string
+				wantUploads int
+				wantFiles   []string
+			}{
+				// Check group1 stats
+				{
+					groupID:     "group1",
+					wantUploads: 2,
+					wantFiles:   []string{"group1_file2.jpg", "group1_file1.jpg"},
+				},
+				// Check group2 stats
+				{
+					groupID:     "group2",
+					wantUploads: 1,
+					wantFiles:   []string{"group2_file1.jpg"},
+				},
+				// Check direct message stats
+				{
+					groupID:     "direct",
+					wantUploads: 2,
+					wantFiles:   []string{"direct_file2.jpg", "direct_file1.jpg"},
+				},
+				// Check global stats (empty groupID)
+				{
+					groupID:     "",
+					wantUploads: 5, // total of all uploads
+					wantFiles:   []string{"direct_file2.jpg", "direct_file1.jpg", "group2_file1.jpg", "group1_file2.jpg", "group1_file1.jpg"},
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Simulate uploads
+			for _, upload := range tt.uploads {
+				trackingGroupID := upload.groupID
+				if trackingGroupID == "" {
+					trackingGroupID = "direct"
+				}
+				groupCache.AddUploadedFile(trackingGroupID, upload.fileName)
+			}
+
+			// Check stats for each scenario
+			for _, check := range tt.checkStats {
+				// Call /stats command
+				handleCommand(bot, "/stats", check.groupID, "test-reply-token", groupCache)
+
+				// Get the last sent message
+				if len(bot.sentMessages) == 0 {
+					t.Fatal("No message was sent")
+				}
+				lastMessage := bot.sentMessages[len(bot.sentMessages)-1]
+
+				// Verify the message contains expected information
+				if !strings.Contains(lastMessage, fmt.Sprintf("Total uploads: %d", check.wantUploads)) {
+					t.Errorf("Expected %d uploads, message was: %s", check.wantUploads, lastMessage)
+				}
+
+				// Check that all expected files are mentioned in the message
+				for _, fileName := range check.wantFiles {
+					if !strings.Contains(lastMessage, fileName) {
+						t.Errorf("Expected file %s not found in message: %s", fileName, lastMessage)
+					}
+				}
+
+				// Clear the bot's messages for the next check
+				bot.sentMessages = nil
+			}
+		})
+	}
 }

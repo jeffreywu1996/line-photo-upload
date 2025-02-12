@@ -15,7 +15,7 @@ func RequestLogger(next http.Handler) http.Handler {
 		// Create a custom response writer to capture status code
 		rw := &responseWriter{
 			ResponseWriter: w,
-			statusCode:    http.StatusOK,
+			statusCode:     http.StatusOK,
 		}
 
 		// Process request
@@ -57,4 +57,15 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Add security headers middleware
+func SecurityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		next.ServeHTTP(w, r)
+	})
 }
